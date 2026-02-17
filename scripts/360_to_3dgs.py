@@ -40,11 +40,11 @@ def check_dependencies() -> dict[str, bool]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         deps["ffmpeg"] = False
 
-    # Check OpenSfM
+    # Check OpenSfM (Python module)
     try:
-        subprocess.run(["opensfm", "--help"], capture_output=True, check=True)
+        import opensfm
         deps["opensfm"] = True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except ImportError:
         deps["opensfm"] = False
 
     return deps
@@ -114,12 +114,13 @@ def create_opensfm_config(
     """
     config_content = f"""# OpenSfM configuration for 360 equirectangular images
 
-# Camera model override - force equirectangular for all images
-camera_models_overrides:
-  "*":
-    projection_type: equirectangular
+# Force spherical/equirectangular camera model
+camera_model_overrides:
+  - make: ""
+    model: ""
     width: {width}
     height: {height}
+    projection_type: spherical
 
 # Matching configuration - use temporal/sequential neighbors
 matching_gps_neighbors: 0
@@ -129,7 +130,7 @@ matching_order_neighbors: {matching_neighbors}
 # Feature detection
 feature_type: SIFT
 feature_root: true
-feature_min_frames: 4000
+feature_min_frames: 8000
 feature_process_size: {max(width, height)}
 
 # Reconstruction settings
@@ -181,6 +182,18 @@ def setup_opensfm_dataset(
     # Create config
     create_opensfm_config(dataset_dir, width, height)
 
+    # Create camera_models.json to force spherical camera
+    camera_models = {
+        "spherical_camera": {
+            "projection_type": "spherical",
+            "width": width,
+            "height": height
+        }
+    }
+    camera_models_path = dataset_dir / "camera_models.json"
+    with open(camera_models_path, 'w') as f:
+        json.dump(camera_models, f, indent=2)
+
     return dataset_dir
 
 
@@ -194,23 +207,43 @@ def run_opensfm(dataset_dir: Path) -> Path:
     Returns:
         Path to reconstruction.json
     """
-    steps = [
-        "extract_metadata",
-        "detect_features",
-        "match_features",
-        "create_tracks",
-        "reconstruct",
+    # Import OpenSfM modules
+    from opensfm.dataset import DataSet
+    from opensfm.commands import (
+        extract_metadata,
+        detect_features,
+        match_features,
+        create_tracks,
+        reconstruct,
+    )
+    from opensfm.reconstruction import ReconstructionAlgorithm
+    import argparse
+
+    # Create dataset
+    data = DataSet(str(dataset_dir))
+
+    # Create args namespace with required attributes
+    args = argparse.Namespace(
+        algorithm=ReconstructionAlgorithm.INCREMENTAL
+    )
+
+    # Define command sequence
+    commands = [
+        ("extract_metadata", extract_metadata.Command),
+        ("detect_features", detect_features.Command),
+        ("match_features", match_features.Command),
+        ("create_tracks", create_tracks.Command),
+        ("reconstruct", reconstruct.Command),
     ]
 
-    for step in tqdm(steps, desc="OpenSfM"):
-        print(f"\nRunning OpenSfM {step}...")
-        cmd = ["opensfm", step, str(dataset_dir)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            print(f"Error in {step}:")
-            print(result.stderr)
-            raise RuntimeError(f"OpenSfM {step} failed")
+    for name, CommandClass in tqdm(commands, desc="OpenSfM"):
+        print(f"\nRunning OpenSfM {name}...")
+        try:
+            cmd = CommandClass()
+            cmd.run(data, args)
+        except Exception as e:
+            print(f"Error in {name}: {e}")
+            raise RuntimeError(f"OpenSfM {name} failed: {e}")
 
     reconstruction_path = dataset_dir / "reconstruction.json"
     if not reconstruction_path.exists():
@@ -267,16 +300,17 @@ def convert_opensfm_to_transforms(
     if not shots:
         raise ValueError("No shots found in reconstruction")
 
-    # Find equirectangular camera or use first
+    # Find spherical/equirectangular camera or use first
     equirect_camera = None
-    for cam_id, cam in cameras.items():
-        if cam.get("projection_type") == "equirectangular":
+    for cam in cameras.values():
+        proj_type = cam.get("projection_type", "")
+        if proj_type in ("equirectangular", "spherical"):
             equirect_camera = cam
             break
 
     if equirect_camera is None:
         equirect_camera = next(iter(cameras.values())) if cameras else {}
-        print("Warning: No equirectangular camera found, using first available")
+        print("Warning: No equirectangular/spherical camera found, using first available")
 
     width = equirect_camera.get("width", 3840)
     height = equirect_camera.get("height", 1920)

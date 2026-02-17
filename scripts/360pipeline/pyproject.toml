@@ -6,5 +6,9 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24.0",
     "opencv-python>=4.8.0",
+    "opensfm",
     "tqdm>=4.65.0",
 ]
+
+[tool.uv.sources]
+opensfm = { git = "https://github.com/mapillary/OpenSfM.git" }
