@@ -522,11 +522,17 @@ Examples:
             shutil.rmtree(lichtfeld_images)
     lichtfeld_images.symlink_to(frames_dir.resolve())
 
-    convert_opensfm_to_transforms(
-        reconstruction_path,
-        transforms_path,
-        images_dir="images"
-    )
+    if reconstruction_path.exists():
+        convert_opensfm_to_transforms(
+            reconstruction_path,
+            transforms_path,
+            images_dir="images"
+        )
+    elif not args.skip_sfm:
+        print("Error: OpenSfM reconstruction failed - no reconstruction.json found")
+        sys.exit(1)
+    else:
+        print("Skipping transforms.json conversion (no reconstruction.json)")
 
     # Step 4: Run LichtFeld
     if not args.skip_training:
