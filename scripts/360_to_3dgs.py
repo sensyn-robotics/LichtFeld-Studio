@@ -316,6 +316,65 @@ def run_opensfm(dataset_dir: Path) -> Path:
     return reconstruction_path
 
 
+def export_sfm_to_ply(reconstruction_path: Path, output_path: Path) -> int:
+    """
+    Export OpenSfM reconstruction points to PLY file for visualization.
+
+    Args:
+        reconstruction_path: Path to OpenSfM reconstruction.json
+        output_path: Path to output PLY file
+
+    Returns:
+        Number of points exported
+    """
+    with open(reconstruction_path) as f:
+        reconstructions = json.load(f)
+
+    if not reconstructions:
+        raise ValueError("No reconstruction found")
+
+    recon = reconstructions[0]
+    points = recon.get("points", {})
+
+    if not points:
+        print("Warning: No points in reconstruction")
+        return 0
+
+    # Collect point data
+    positions = []
+    colors = []
+
+    for point_id, point_data in points.items():
+        coords = point_data.get("coordinates", [0, 0, 0])
+        color = point_data.get("color", [128, 128, 128])
+        positions.append(coords)
+        colors.append(color)
+
+    positions = np.array(positions, dtype=np.float32)
+    colors = np.array(colors, dtype=np.uint8)
+
+    # Write PLY file
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'w') as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(positions)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        for pos, col in zip(positions, colors):
+            f.write(f"{pos[0]} {pos[1]} {pos[2]} {col[0]} {col[1]} {col[2]}\n")
+
+    print(f"Exported {len(positions)} SfM points to {output_path}")
+    return len(positions)
+
+
 def rotation_from_angle_axis(angle_axis: list[float]) -> np.ndarray:
     """Convert angle-axis rotation to rotation matrix using Rodrigues' formula."""
     angle_axis = np.array(angle_axis)
@@ -626,6 +685,11 @@ Examples:
     else:
         reconstruction_path = opensfm_dir / "reconstruction.json"
 
+    # Export SfM point cloud to PLY for visualization
+    if reconstruction_path.exists():
+        sfm_ply_path = output_dir / "sfm_points.ply"
+        export_sfm_to_ply(reconstruction_path, sfm_ply_path)
+
     # Step 3: Convert to transforms.json
     transforms_path = output_dir / "transforms.json"
 
@@ -662,6 +726,7 @@ Examples:
     print("\n" + "=" * 60)
     print("Pipeline complete!")
     print(f"Output directory: {output_dir}")
+    print(f"SfM points: {output_dir / 'sfm_points.ply'}")
     print(f"Transforms: {transforms_path}")
     print(f"Splat output: {lichtfeld_output}")
     print("=" * 60)
