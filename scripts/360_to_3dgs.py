@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 from tqdm import tqdm
 
@@ -48,6 +49,58 @@ def check_dependencies() -> dict[str, bool]:
         deps["opensfm"] = False
 
     return deps
+
+
+def resize_images(
+    input_dir: Path,
+    output_dir: Path,
+    max_resolution: int,
+) -> tuple[int, int]:
+    """
+    Resize images to fit within max_resolution while maintaining aspect ratio.
+
+    Args:
+        input_dir: Directory containing original images
+        output_dir: Directory to save resized images
+        max_resolution: Maximum width or height
+
+    Returns:
+        Tuple of (new_width, new_height)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_files = sorted(input_dir.glob("*.jpg"))
+    if not image_files:
+        raise ValueError(f"No images found in {input_dir}")
+
+    # Read first image to get dimensions
+    first_img = cv2.imread(str(image_files[0]))
+    orig_h, orig_w = first_img.shape[:2]
+
+    # Calculate new dimensions
+    scale = min(max_resolution / orig_w, max_resolution / orig_h)
+    if scale >= 1.0:
+        # No resize needed
+        print(f"Images already within {max_resolution}px, no resize needed")
+        # Copy files instead
+        for img_file in image_files:
+            shutil.copy(img_file, output_dir / img_file.name)
+        return orig_w, orig_h
+
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    # Ensure even dimensions for video codecs
+    new_w = new_w - (new_w % 2)
+    new_h = new_h - (new_h % 2)
+
+    print(f"Resizing images: {orig_w}x{orig_h} -> {new_w}x{new_h} (scale: {scale:.2f})")
+
+    for img_file in tqdm(image_files, desc="Resizing"):
+        img = cv2.imread(str(img_file))
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        cv2.imwrite(str(output_dir / img_file.name), resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    return new_w, new_h
 
 
 def extract_frames(
@@ -112,15 +165,7 @@ def create_opensfm_config(
     Returns:
         Path to config file
     """
-    config_content = f"""# OpenSfM configuration for 360 equirectangular images
-
-# Force spherical/equirectangular camera model
-camera_model_overrides:
-  - make: ""
-    model: ""
-    width: {width}
-    height: {height}
-    projection_type: spherical
+    config_content = f"""# OpenSfM configuration for 360 equirectangular/spherical images
 
 # Matching configuration - use temporal/sequential neighbors
 matching_gps_neighbors: 0
@@ -182,9 +227,28 @@ def setup_opensfm_dataset(
     # Create config
     create_opensfm_config(dataset_dir, width, height)
 
-    # Create camera_models.json to force spherical camera
+    # Create exif_overrides.json to force spherical camera for each image
+    # This is the proper way to override camera model in OpenSfM
+    image_files = sorted(images_dir.glob("*.jpg"))
+    exif_overrides = {}
+    for img_file in image_files:
+        exif_overrides[img_file.name] = {
+            "camera": "spherical_360",
+            "make": "360_camera",
+            "model": "equirectangular",
+            "width": width,
+            "height": height,
+            "projection_type": "spherical",
+            "focal_ratio": 0.5,  # Standard for equirectangular
+        }
+
+    exif_overrides_path = dataset_dir / "exif_overrides.json"
+    with open(exif_overrides_path, 'w') as f:
+        json.dump(exif_overrides, f, indent=2)
+
+    # Create camera_models.json to define the spherical camera
     camera_models = {
-        "spherical_camera": {
+        "spherical_360": {
             "projection_type": "spherical",
             "width": width,
             "height": height
@@ -194,6 +258,7 @@ def setup_opensfm_dataset(
     with open(camera_models_path, 'w') as f:
         json.dump(camera_models, f, indent=2)
 
+    print(f"Created exif_overrides.json for {len(image_files)} images (spherical)")
     return dataset_dir
 
 
@@ -217,13 +282,12 @@ def run_opensfm(dataset_dir: Path) -> Path:
         reconstruct,
     )
     from opensfm.reconstruction import ReconstructionAlgorithm
-    import argparse
 
     # Create dataset
     data = DataSet(str(dataset_dir))
 
-    # Create args namespace with required attributes
-    args = argparse.Namespace(
+    # Create args namespace with required attributes for OpenSfM commands
+    opensfm_args = argparse.Namespace(
         algorithm=ReconstructionAlgorithm.INCREMENTAL
     )
 
@@ -240,7 +304,7 @@ def run_opensfm(dataset_dir: Path) -> Path:
         print(f"\nRunning OpenSfM {name}...")
         try:
             cmd = CommandClass()
-            cmd.run(data, args)
+            cmd.run(data, opensfm_args)
         except Exception as e:
             print(f"Error in {name}: {e}")
             raise RuntimeError(f"OpenSfM {name} failed: {e}")
@@ -488,6 +552,12 @@ Examples:
         action="store_true",
         help="Skip LichtFeld training (only run SfM)"
     )
+    parser.add_argument(
+        "--max-resolution",
+        type=int,
+        default=2048,
+        help="Maximum image resolution (default: 2048). Use 0 to disable resizing."
+    )
 
     args = parser.parse_args()
 
@@ -512,6 +582,7 @@ Examples:
 
     # Setup directories
     output_dir = args.output
+    frames_raw_dir = output_dir / "frames_raw"
     frames_dir = output_dir / "frames"
     opensfm_dir = output_dir / "opensfm"
     lichtfeld_output = output_dir / "output"
@@ -520,22 +591,33 @@ Examples:
     if not args.skip_extraction:
         extract_frames(
             args.input,
-            frames_dir,
+            frames_raw_dir,
             fps=args.fps,
             start_time=args.start,
             duration=args.duration
         )
 
-    # Get image dimensions from first frame
-    if frames_dir.exists():
-        import cv2
-        first_frame = next(frames_dir.glob("*.jpg"))
+    # Get original image dimensions from first frame
+    raw_frames = frames_raw_dir if frames_raw_dir.exists() else frames_dir
+    if raw_frames.exists():
+        first_frame = next(raw_frames.glob("*.jpg"))
         img = cv2.imread(str(first_frame))
-        height, width = img.shape[:2]
-        print(f"Frame dimensions: {width}x{height}")
+        orig_height, orig_width = img.shape[:2]
+        print(f"Original frame dimensions: {orig_width}x{orig_height}")
     else:
         print("Error: No frames found")
         sys.exit(1)
+
+    # Step 1.5: Resize frames if needed
+    if args.max_resolution > 0 and frames_raw_dir.exists():
+        width, height = resize_images(frames_raw_dir, frames_dir, args.max_resolution)
+    else:
+        # No resize - use raw frames directly
+        if frames_raw_dir.exists() and not frames_dir.exists():
+            frames_dir.symlink_to(frames_raw_dir.resolve())
+        width, height = orig_width, orig_height
+
+    print(f"Working frame dimensions: {width}x{height}")
 
     # Step 2: Run OpenSfM
     if not args.skip_sfm:
