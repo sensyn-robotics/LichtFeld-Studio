@@ -19,6 +19,7 @@ Requirements:
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -151,7 +152,7 @@ def create_opensfm_config(
     dataset_dir: Path,
     width: int,
     height: int,
-    matching_neighbors: int = 5
+    quality: str = "high"
 ) -> Path:
     """
     Create OpenSfM configuration for equirectangular images.
@@ -160,23 +161,25 @@ def create_opensfm_config(
         dataset_dir: OpenSfM dataset directory
         width: Image width
         height: Image height
-        matching_neighbors: Number of temporal neighbors for matching
+        quality: Quality preset - "fast" or "high" (default: "high")
 
     Returns:
         Path to config file
     """
-    config_content = f"""# OpenSfM configuration for 360 equirectangular/spherical images
-
-# Matching configuration - use temporal/sequential neighbors
-matching_gps_neighbors: 0
-matching_time_neighbors: {matching_neighbors}
-matching_order_neighbors: {matching_neighbors}
+    if quality == "fast":
+        # Fast settings - original parameters for quick testing
+        config_content = f"""# OpenSfM configuration for 360 spherical images - FAST
 
 # Feature detection
 feature_type: SIFT
 feature_root: true
 feature_min_frames: 8000
 feature_process_size: {max(width, height)}
+
+# Matching - basic settings
+matching_gps_neighbors: 0
+matching_time_neighbors: 5
+matching_order_neighbors: 5
 
 # Reconstruction settings
 retriangulation_ratio: 1.2
@@ -185,11 +188,48 @@ bundle_outlier_filtering_type: AUTO
 # Depthmap settings
 depthmap_min_patch_sd: 1.0
 """
+    else:
+        # High quality settings optimized for 360 equirectangular video
+        # Key changes: more aggressive matching, graph-based matching,
+        # higher feature count, better triangulation thresholds
+        config_content = f"""# OpenSfM configuration for 360 spherical images - HIGH QUALITY
+# Optimized for equirectangular 360 video with circular camera motion
+
+# Feature detection - more features for better coverage across equirectangular
+feature_type: SIFT
+feature_root: true
+feature_min_frames: 20000
+feature_process_size: {min(4096, max(width, height))}
+sift_peak_threshold: 0.02
+
+# Matching - more aggressive for 360 wrap-around and loop closure
+matching_gps_neighbors: 0
+matching_time_neighbors: 15
+matching_order_neighbors: 15
+matching_graph_rounds: 50
+lowes_ratio: 0.85
+
+# Reconstruction - require larger angles for better triangulation
+triangulation_min_ray_angle: 1.5
+triangulation_threshold: 0.01
+retriangulation_ratio: 1.1
+
+# Bundle adjustment - ensure good track overlap
+bundle_outlier_filtering_type: AUTO
+bundle_common_tracks_ratio: 0.6
+
+# Alignment - use orientation prior for better pose estimation
+align_method: orientation_prior
+bundle_use_gps: false
+
+# Depthmap settings
+depthmap_min_patch_sd: 1.0
+"""
 
     config_path = dataset_dir / "config.yaml"
     config_path.write_text(config_content)
 
-    print(f"Created OpenSfM config: {config_path}")
+    print(f"Created OpenSfM config ({quality} quality): {config_path}")
     return config_path
 
 
@@ -197,7 +237,8 @@ def setup_opensfm_dataset(
     frames_dir: Path,
     dataset_dir: Path,
     width: int,
-    height: int
+    height: int,
+    quality: str = "high"
 ) -> Path:
     """
     Set up OpenSfM dataset structure.
@@ -207,6 +248,7 @@ def setup_opensfm_dataset(
         dataset_dir: OpenSfM dataset directory to create
         width: Image width
         height: Image height
+        quality: Quality preset - "fast" or "high" (default: "high")
 
     Returns:
         Path to dataset directory
@@ -225,21 +267,22 @@ def setup_opensfm_dataset(
     shutil.copytree(frames_dir, images_dir)
 
     # Create config
-    create_opensfm_config(dataset_dir, width, height)
+    create_opensfm_config(dataset_dir, width, height, quality)
 
     # Create exif_overrides.json to force spherical camera for each image
     # This is the proper way to override camera model in OpenSfM
+    # Using "v2 spherical 0.5" format which OpenSfM recognizes for equirectangular
     image_files = sorted(images_dir.glob("*.jpg"))
     exif_overrides = {}
     for img_file in image_files:
         exif_overrides[img_file.name] = {
-            "camera": "spherical_360",
+            "camera": "v2 spherical 0.5",  # OpenSfM spherical camera format
             "make": "360_camera",
             "model": "equirectangular",
             "width": width,
             "height": height,
-            "projection_type": "spherical",
-            "focal_ratio": 0.5,  # Standard for equirectangular
+            "projection_type": "equirectangular",
+            "focal": 0.5,  # Standard equirectangular focal length
         }
 
     exif_overrides_path = dataset_dir / "exif_overrides.json"
@@ -248,10 +291,11 @@ def setup_opensfm_dataset(
 
     # Create camera_models.json to define the spherical camera
     camera_models = {
-        "spherical_360": {
+        "v2 spherical 0.5": {
             "projection_type": "spherical",
             "width": width,
-            "height": height
+            "height": height,
+            "focal": 0.5
         }
     }
     camera_models_path = dataset_dir / "camera_models.json"
@@ -375,6 +419,89 @@ def export_sfm_to_ply(reconstruction_path: Path, output_path: Path) -> int:
     return len(positions)
 
 
+def validate_sfm_quality(reconstruction_path: Path) -> dict:
+    """
+    Check SfM quality and warn if poor.
+
+    Args:
+        reconstruction_path: Path to OpenSfM reconstruction.json
+
+    Returns:
+        Dictionary with quality metrics
+    """
+    with open(reconstruction_path) as f:
+        reconstructions = json.load(f)
+
+    if not reconstructions:
+        print("WARNING: No reconstruction found!")
+        return {"valid": False}
+
+    recon = reconstructions[0]
+    n_cameras = len(recon.get("shots", {}))
+    n_points = len(recon.get("points", {}))
+
+    points_per_cam = n_points / n_cameras if n_cameras > 0 else 0
+
+    # Analyze camera path
+    shots = recon.get("shots", {})
+    if shots:
+        positions = []
+        for shot in shots.values():
+            rotation = shot.get("rotation", [0, 0, 0])
+            translation = shot.get("translation", [0, 0, 0])
+            R = rotation_from_angle_axis(rotation)
+            t = np.array(translation)
+            C = -R.T @ t  # Camera center in world coordinates
+            positions.append(C)
+
+        positions = np.array(positions)
+        centroid = positions.mean(axis=0)
+        radii = np.linalg.norm(positions - centroid, axis=1)
+
+        # Calculate path length
+        path_length = sum(
+            np.linalg.norm(positions[i] - positions[i-1])
+            for i in range(1, len(positions))
+        )
+        start_end_dist = np.linalg.norm(positions[-1] - positions[0])
+
+        # Detect if path is circular
+        is_circular = start_end_dist < path_length * 0.3
+
+        print(f"\nSfM Quality Report:")
+        print(f"  Cameras: {n_cameras}")
+        print(f"  Points: {n_points} ({points_per_cam:.0f} points/camera)")
+        print(f"  Centroid: ({centroid[0]:.2f}, {centroid[1]:.2f}, {centroid[2]:.2f})")
+        print(f"  Radius: {radii.min():.2f}m - {radii.max():.2f}m (std: {radii.std():.2f}m)")
+        print(f"  Path length: {path_length:.2f}m")
+        print(f"  Start-end distance: {start_end_dist:.2f}m")
+        print(f"  Path type: {'CIRCULAR' if is_circular else 'LINEAR'}")
+
+        # Warnings
+        if points_per_cam < 2000:
+            print(f"\nWARNING: Low SfM point density ({points_per_cam:.0f} points/camera)")
+            print("         This may cause poor 3DGS quality.")
+            print("         Consider: higher fps, better camera motion, or different scene.")
+
+        if radii.std() > radii.mean() * 0.3:
+            print("\nWARNING: Inconsistent camera distances from centroid")
+            print(f"         Radius std ({radii.std():.2f}m) is >30% of mean ({radii.mean():.2f}m)")
+            print("         This suggests inaccurate pose estimation.")
+
+        return {
+            "valid": True,
+            "n_cameras": n_cameras,
+            "n_points": n_points,
+            "points_per_cam": points_per_cam,
+            "path_length": path_length,
+            "is_circular": is_circular,
+            "radius_mean": radii.mean(),
+            "radius_std": radii.std(),
+        }
+
+    return {"valid": True, "n_cameras": n_cameras, "n_points": n_points}
+
+
 def rotation_from_angle_axis(angle_axis: list[float]) -> np.ndarray:
     """Convert angle-axis rotation to rotation matrix using Rodrigues' formula."""
     angle_axis = np.array(angle_axis)
@@ -438,10 +565,18 @@ def convert_opensfm_to_transforms(
     width = equirect_camera.get("width", 3840)
     height = equirect_camera.get("height", 1920)
 
+    # Proper focal lengths for equirectangular projection
+    # For equirectangular: fl_x = width / (2 * pi), fl_y = height / pi
+    fl_x = width / (2 * math.pi)
+    fl_y = height / math.pi
+
     transforms = {
         "camera_model": "EQUIRECTANGULAR",
         "w": width,
         "h": height,
+        "fl_x": fl_x,
+        "fl_y": fl_y,
+        "ply_file_path": "sfm_points.ply",
         "frames": []
     }
 
@@ -548,8 +683,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic usage
+    # Basic usage (uses high quality SfM by default)
     python 360_to_3dgs.py video.mp4 output/
+
+    # Fast mode for quick testing
+    python 360_to_3dgs.py video.mp4 output/ --quality fast
 
     # With custom settings
     python 360_to_3dgs.py video.mp4 output/ --fps 2 --iterations 20000
@@ -572,8 +710,8 @@ Examples:
     parser.add_argument(
         "--fps",
         type=float,
-        default=1.0,
-        help="Frame extraction rate (default: 1.0)"
+        default=2.0,
+        help="Frame extraction rate (default: 2.0)"
     )
     parser.add_argument(
         "--iterations", "-i",
@@ -616,6 +754,19 @@ Examples:
         type=int,
         default=2048,
         help="Maximum image resolution (default: 2048). Use 0 to disable resizing."
+    )
+    parser.add_argument(
+        "--quality",
+        choices=["fast", "high"],
+        default="high",
+        help="SfM quality preset (default: high). 'high' uses more features and stricter matching."
+    )
+    parser.add_argument(
+        "--tile-mode",
+        type=int,
+        choices=[1, 2, 4],
+        default=2,
+        help="Tile mode for memory-efficient training: 1=1 tile, 2=2 tiles, 4=4 tiles (default: 2)"
     )
 
     args = parser.parse_args()
@@ -680,7 +831,7 @@ Examples:
 
     # Step 2: Run OpenSfM
     if not args.skip_sfm:
-        setup_opensfm_dataset(frames_dir, opensfm_dir, width, height)
+        setup_opensfm_dataset(frames_dir, opensfm_dir, width, height, args.quality)
         reconstruction_path = run_opensfm(opensfm_dir)
     else:
         reconstruction_path = opensfm_dir / "reconstruction.json"
@@ -689,6 +840,9 @@ Examples:
     if reconstruction_path.exists():
         sfm_ply_path = output_dir / "sfm_points.ply"
         export_sfm_to_ply(reconstruction_path, sfm_ply_path)
+
+        # Validate SfM quality and warn about potential issues
+        validate_sfm_quality(reconstruction_path)
 
     # Step 3: Convert to transforms.json
     transforms_path = output_dir / "transforms.json"
@@ -716,11 +870,13 @@ Examples:
 
     # Step 4: Run LichtFeld
     if not args.skip_training:
+        extra_args = [f"--tile-mode={args.tile_mode}"]
         run_lichtfeld(
             output_dir,
             lichtfeld_output,
             iterations=args.iterations,
-            lichtfeld_path=args.lichtfeld_path
+            lichtfeld_path=args.lichtfeld_path,
+            extra_args=extra_args
         )
 
     print("\n" + "=" * 60)
