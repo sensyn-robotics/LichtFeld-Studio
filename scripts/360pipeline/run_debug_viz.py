@@ -164,6 +164,20 @@ def run_all_visualizations(
             print("\n[Skipping SfM vs 3DGS comparison - no splat file found]")
             all_stats["comparison"] = {"skipped": "no splat file found"}
 
+    # Move PLY files to ply_output/ subdirectory to prevent browser freeze
+    # when opening HTML files (Chrome scans directories with large files)
+    ply_dir = output_dir / "ply_output"
+    ply_dir.mkdir(exist_ok=True)
+    ply_files = list(output_dir.glob("**/*.ply"))
+    moved_count = 0
+    for ply_file in ply_files:
+        if ply_file.parent != ply_dir:
+            dest = ply_dir / ply_file.name
+            ply_file.rename(dest)
+            moved_count += 1
+    if moved_count > 0:
+        print(f"Moved {moved_count} PLY files to {ply_dir}")
+
     # Generate summary report
     print("\n" + "=" * 60)
     print("Generating Summary Report")
