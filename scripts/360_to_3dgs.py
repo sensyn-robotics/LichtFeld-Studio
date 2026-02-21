@@ -360,13 +360,22 @@ def run_opensfm(dataset_dir: Path) -> Path:
     return reconstruction_path
 
 
-def export_sfm_to_ply(reconstruction_path: Path, output_path: Path) -> int:
+def export_sfm_to_ply(
+    reconstruction_path: Path,
+    output_path: Path,
+    outlier_percentile: float = 95.0,
+) -> int:
     """
     Export OpenSfM reconstruction points to PLY file for visualization.
+
+    Includes outlier filtering to remove distant points that can pollute
+    3DGS initialization (common in 360/equirectangular SfM).
 
     Args:
         reconstruction_path: Path to OpenSfM reconstruction.json
         output_path: Path to output PLY file
+        outlier_percentile: Remove points beyond this percentile distance
+                           from centroid (default: 95.0)
 
     Returns:
         Number of points exported
@@ -396,6 +405,19 @@ def export_sfm_to_ply(reconstruction_path: Path, output_path: Path) -> int:
 
     positions = np.array(positions, dtype=np.float32)
     colors = np.array(colors, dtype=np.uint8)
+
+    # Filter outliers based on distance from centroid
+    original_count = len(positions)
+    centroid = positions.mean(axis=0)
+    dists = np.linalg.norm(positions - centroid, axis=1)
+    threshold = np.percentile(dists, outlier_percentile)
+    mask = dists <= threshold
+    positions = positions[mask]
+    colors = colors[mask]
+
+    removed = original_count - len(positions)
+    if removed > 0:
+        print(f"Filtered {removed} outlier points (>{outlier_percentile}th percentile, >{threshold:.1f}m from centroid)")
 
     # Write PLY file
     output_path.parent.mkdir(parents=True, exist_ok=True)

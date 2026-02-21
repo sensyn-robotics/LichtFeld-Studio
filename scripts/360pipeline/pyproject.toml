@@ -8,6 +8,10 @@ dependencies = [
     "opencv-python>=4.8.0",
     "opensfm",
     "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
+    "plotly>=5.15.0",
+    "plyfile>=1.0.0",
+    "scipy>=1.10.0",
 ]
 
 [tool.uv.sources]
