@@ -164,19 +164,28 @@ def run_all_visualizations(
             print("\n[Skipping SfM vs 3DGS comparison - no splat file found]")
             all_stats["comparison"] = {"skipped": "no splat file found"}
 
-    # Move PLY files to ply_output/ subdirectory to prevent browser freeze
-    # when opening HTML files (Chrome scans directories with large files)
-    ply_dir = output_dir / "ply_output"
-    ply_dir.mkdir(exist_ok=True)
-    ply_files = list(output_dir.glob("**/*.ply"))
-    moved_count = 0
-    for ply_file in ply_files:
-        if ply_file.parent != ply_dir:
-            dest = ply_dir / ply_file.name
-            ply_file.rename(dest)
-            moved_count += 1
-    if moved_count > 0:
-        print(f"Moved {moved_count} PLY files to {ply_dir}")
+    # Move large files/dirs to debug_data/ (sibling of debug/) to prevent browser freeze
+    # Chrome recursively scans directories when opening local HTML files
+    import shutil
+    data_dir = output_dir.parent / "debug_data"
+    data_dir.mkdir(exist_ok=True)
+
+    # Move large directories (images, plotly visualizations)
+    large_dirs = ["matches", "reprojection", "cameras"]
+    for dirname in large_dirs:
+        src = output_dir / dirname
+        if src.exists():
+            dest = data_dir / dirname
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.move(str(src), str(dest))
+
+    # Move all PLY files
+    for ply_file in output_dir.glob("**/*.ply"):
+        dest = data_dir / ply_file.name
+        ply_file.rename(dest)
+
+    print(f"Moved large files to {data_dir} (keeps debug/ fast to open)")
 
     # Generate summary report
     print("\n" + "=" * 60)
@@ -189,9 +198,19 @@ def run_all_visualizations(
     # Save raw stats as JSON
     (output_dir / "stats.json").write_text(json.dumps(all_stats, indent=2))
 
+    # Create launcher script (avoids Chrome freeze with local files)
+    launcher_script = output_dir / "open_report.sh"
+    launcher_script.write_text("""#!/bin/bash
+cd "$(dirname "$0")"
+echo "Starting server at http://localhost:8000/summary_report.html"
+xdg-open "http://localhost:8000/summary_report.html" &
+python3 -m http.server 8000
+""")
+    launcher_script.chmod(0o755)
+
     print(f"\n✓ All visualizations complete!")
     print(f"  Output directory: {output_dir}")
-    print(f"  Summary report: {output_dir / 'summary_report.html'}")
+    print(f"  To view report: cd {output_dir} && ./open_report.sh")
 
     return all_stats
 
@@ -251,25 +270,36 @@ def generate_summary_report(stats: dict, output_dir: Path) -> str:
     diagnosis_html = "<ul>" + "".join(diagnosis) + "</ul>" if diagnosis else "<p>✓ No major issues detected</p>"
     recommendations_html = "<ul>" + "".join(recommendations) + "</ul>" if recommendations else "<p>No specific recommendations</p>"
 
-    # Build visualization links (only link to HTML/PNG files, not directories)
+    # Build visualization links
+    # Large files are in ../debug_data/, small files remain in debug/
     viz_links = []
-    subdirs = ["matches", "tracks", "sfm", "cameras", "reprojection", "comparison"]
-    for subdir in subdirs:
-        subdir_path = output_dir / subdir
-        if subdir_path.exists():
-            # Find HTML files
-            html_files = list(subdir_path.glob("*.html"))
-            png_files = list(subdir_path.glob("*.png"))
+    data_dir = output_dir.parent / "debug_data"
+
+    # Check both debug/ and debug_data/ for visualization files
+    viz_locations = [
+        ("matches", data_dir / "matches", "../debug_data/matches"),
+        ("tracks", output_dir / "tracks", "tracks"),
+        ("sfm", output_dir / "sfm", "sfm"),
+        ("cameras", data_dir / "cameras", "../debug_data/cameras"),
+        ("reprojection", data_dir / "reprojection", "../debug_data/reprojection"),
+        ("comparison", output_dir / "comparison", "comparison"),
+    ]
+
+    for name, path, href_prefix in viz_locations:
+        if path.exists():
+            html_files = list(path.glob("*.html"))
+            png_files = list(path.glob("*.png"))
             if html_files:
                 for html_file in html_files:
-                    viz_links.append(f'<li><a href="{subdir}/{html_file.name}">{subdir}: {html_file.stem}</a></li>')
+                    viz_links.append(f'<li><a href="{href_prefix}/{html_file.name}">{name}: {html_file.stem}</a></li>')
             elif png_files:
-                # Link to first PNG as preview
-                viz_links.append(f'<li><a href="{subdir}/{png_files[0].name}">{subdir}: {png_files[0].stem}</a> ({len(png_files)} images)</li>')
-            else:
-                # Just show text, no link to directory (avoids browser scanning large dirs)
-                ply_files = list(subdir_path.glob("*.ply"))
-                viz_links.append(f'<li>{subdir}: {len(ply_files)} PLY files (open folder manually)</li>')
+                viz_links.append(f'<li><a href="{href_prefix}/{png_files[0].name}">{name}: {png_files[0].stem}</a></li>')
+
+    # Add link to PLY files location
+    if data_dir.exists():
+        ply_count = len(list(data_dir.glob("*.ply")))
+        if ply_count > 0:
+            viz_links.append(f'<li>PLY point clouds: {ply_count} files in <code>debug_data/</code></li>')
 
     viz_links_html = "<ul>" + "".join(viz_links) + "</ul>"
 
