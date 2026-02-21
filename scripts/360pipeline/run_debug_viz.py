@@ -199,11 +199,12 @@ def run_all_visualizations(
     (output_dir / "stats.json").write_text(json.dumps(all_stats, indent=2))
 
     # Create launcher script (avoids Chrome freeze with local files)
+    # Server starts from parent dir to serve both debug/ and debug_data/
     launcher_script = output_dir / "open_report.sh"
     launcher_script.write_text("""#!/bin/bash
-cd "$(dirname "$0")"
-echo "Starting server at http://localhost:8000/summary_report.html"
-xdg-open "http://localhost:8000/summary_report.html" &
+cd "$(dirname "$0")/.."
+echo "Starting server at http://localhost:8000/debug/summary_report.html"
+xdg-open "http://localhost:8000/debug/summary_report.html" &
 python3 -m http.server 8000
 """)
     launcher_script.chmod(0o755)
