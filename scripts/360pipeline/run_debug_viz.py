@@ -237,7 +237,7 @@ def generate_summary_report(stats: dict, output_dir: Path) -> str:
     diagnosis_html = "<ul>" + "".join(diagnosis) + "</ul>" if diagnosis else "<p>✓ No major issues detected</p>"
     recommendations_html = "<ul>" + "".join(recommendations) + "</ul>" if recommendations else "<p>No specific recommendations</p>"
 
-    # Build visualization links
+    # Build visualization links (only link to HTML/PNG files, not directories)
     viz_links = []
     subdirs = ["matches", "tracks", "sfm", "cameras", "reprojection", "comparison"]
     for subdir in subdirs:
@@ -245,11 +245,17 @@ def generate_summary_report(stats: dict, output_dir: Path) -> str:
         if subdir_path.exists():
             # Find HTML files
             html_files = list(subdir_path.glob("*.html"))
+            png_files = list(subdir_path.glob("*.png"))
             if html_files:
                 for html_file in html_files:
                     viz_links.append(f'<li><a href="{subdir}/{html_file.name}">{subdir}: {html_file.stem}</a></li>')
+            elif png_files:
+                # Link to first PNG as preview
+                viz_links.append(f'<li><a href="{subdir}/{png_files[0].name}">{subdir}: {png_files[0].stem}</a> ({len(png_files)} images)</li>')
             else:
-                viz_links.append(f'<li><a href="{subdir}/">{subdir}</a></li>')
+                # Just show text, no link to directory (avoids browser scanning large dirs)
+                ply_files = list(subdir_path.glob("*.ply"))
+                viz_links.append(f'<li>{subdir}: {len(ply_files)} PLY files (open folder manually)</li>')
 
     viz_links_html = "<ul>" + "".join(viz_links) + "</ul>"
 
@@ -269,6 +275,7 @@ def generate_summary_report(stats: dict, output_dir: Path) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <title>360 to 3DGS Debug Report</title>
     <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; max-width: 1200px; margin: 0 auto; padding: 20px; }}
