@@ -253,6 +253,19 @@ def generate_summary_report(stats: dict, output_dir: Path) -> str:
 
     viz_links_html = "<ul>" + "".join(viz_links) + "</ul>"
 
+    # Create summarized stats for HTML (remove large arrays)
+    def summarize_stats(obj):
+        """Recursively summarize stats, replacing large arrays with summaries."""
+        if isinstance(obj, dict):
+            return {k: summarize_stats(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            if len(obj) > 20:
+                return f"[{len(obj)} items, min={min(obj)}, max={max(obj)}, mean={sum(obj)/len(obj):.1f}]"
+            return obj
+        return obj
+
+    summarized_stats = summarize_stats(stats)
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -319,9 +332,10 @@ def generate_summary_report(stats: dict, output_dir: Path) -> str:
     <h2>Detailed Statistics</h2>
     <div class="section">
         <details>
-            <summary>Click to expand raw statistics</summary>
-            <pre>{json.dumps(stats, indent=2)}</pre>
+            <summary>Click to expand statistics summary</summary>
+            <pre>{json.dumps(summarized_stats, indent=2)}</pre>
         </details>
+        <p><small>Full statistics saved to <a href="stats.json">stats.json</a></small></p>
     </div>
 </body>
 </html>
